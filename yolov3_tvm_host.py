@@ -268,8 +268,8 @@ image_data = image_preporcess(np.copy(original_image), [input_size, input_size])
 image_data = image_data[np.newaxis, ...]
 image_data = image_data.astype(np.float32)
 
-#CHECKPOINT = './saved/'
-CHECKPOINT = '../.tvm_test_data/tf/YoloV3/yolov3_coco.pb'
+CHECKPOINT = './saved/'
+#CHECKPOINT = '../.tvm_test_data/tf/YoloV3/yolov3_coco.pb'
 layout = "NCHW"
 
 data_shape = image_data.shape
