@@ -1,26 +1,32 @@
 # To be able to target the Vitis-AI cloud DPUCZDX8G target we first have to import the target in PyXIR. i
 # This PyXIR package is the interface being used by TVM to integrate with the Vitis-AI stack. Additionaly, i
 # import the typical TVM and Relay modules and the Vitis-AI contrib module inside TVM.
+import os
 import sys
 import numpy as np
+from pathlib import Path
+
 
 import pyxir
 import pyxir.contrib.target.DPUCZDX8G
 
 import tvm
 import tvm.relay as relay
-from tvm.contrib.target import vitis_ai
+from tvm import contrib
+from tvm.relay import transform
 from tvm.contrib import utils, graph_runtime
+from tvm.contrib.target import vitis_ai
 from tvm.relay.build_module import bind_params_by_name
 from tvm.relay.op.contrib.vitis_ai import annotation
+from tvm.relay.frontend.tensorflow_parser import TFParser
+
 import colorsys
 import random
+import cv2
 from PIL import Image
 
 # After importing a convolutional neural network model using the usual Relay API's, 
 # annotate the Relay expression for the given Vitis-AI DPU target and partition the graph.
-import cv2
-from tvm.relay.frontend.tensorflow_parser import TFParser
 #from tensorflow.contrib import decent_q
 
 def read_class_names(class_file_name):
@@ -185,83 +191,194 @@ def image_preporcess(image, target_size, gt_boxes=None):
         gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]] * scale + dh
         return image_paded, gt_boxes
 
+def build_module(
+    mod,
+    target,
+    dpu_target="DPUCADX8G",
+    params=None,
+    enable_vitis_ai=True,
+    #enable_vitis_ai=False,
+    tvm_ops=0,
+    vitis_ai_partitions=1,
+):
+    """Build module for Vitis-AI codegen."""
+    if isinstance(mod, tvm.relay.expr.Call):
+        mod = tvm.IRModule.from_expr(mod)
+        print("in the build_module---------------------------------------------------")
+    if params is None:
+        params = {}
+
+    print("in the build_module---------------------------------------------------")
+    #mod = relay.transform.InferType()(mod)
+    temp = utils.tempdir()
+    print(temp)
+    export_rt_mod_file = temp.relpath("vitis_ai.rtmod")
+    with tvm.transform.PassContext(
+        opt_level=3, config={"relay.ext.vitis_ai.options.target": dpu_target,
+                             'relay.ext.vitis_ai.options.export_runtime_module': export_rt_mod_file}
+    ):
+        if enable_vitis_ai:
+            mod["main"] = bind_params_by_name(mod["main"], params)
+            mod = annotation(mod, params, dpu_target)
+            mod = transform.MergeCompilerRegions()(mod)
+            mod = transform.PartitionGraph()(mod)
+            tvm_op_count = get_cpu_op_count(mod)
+            assert tvm_op_count == tvm_ops, "Got {} TVM operators, expected {}".format(
+                tvm_op_count, tvm_ops
+            )
+            partition_count = 0
+            for global_var in mod.get_global_vars():
+                if "vitis_ai" in global_var.name_hint:
+                    partition_count += 1
+
+            assert (
+                vitis_ai_partitions == partition_count
+            ), "Got {} Vitis-AI partitions, expected {}".format(
+                partition_count, vitis_ai_partitions
+            )
+        relay.backend.compile_engine.get().clear()
+        return relay.build(mod, target, params=params)
+
+
+def inputs_func(img_files):
+    """Utility function to read images from a list"""
+    inputs = []
+    input_size = 416
+    dtype = 'float32'
+    for img_path in img_files:
+        original_image = cv2.imread(img_path)
+        #print(img_path)
+        original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+        image_data = image_preporcess(np.copy(original_image), [input_size, input_size])
+        image_data = image_data[np.newaxis, ...]
+        image_data = image_data.astype(np.float32)
+        image_data = tvm.nd.array(image_data.astype(dtype))
+
+        inputs.append(image_data)
+    return inputs
+
+
 
 input_size = 416
 original_image = cv2.imread('horses.jpg')
+#original_image = cv2.imread('../voc/000002.jpg')
 original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
 original_image_size = original_image.shape[:2]
 image_data = image_preporcess(np.copy(original_image), [input_size, input_size])
 image_data = image_data[np.newaxis, ...]
 image_data = image_data.astype(np.float32)
 
-CHECKPOINT = './saved/'
+#CHECKPOINT = './saved/'
+CHECKPOINT = '../.tvm_test_data/tf/YoloV3/yolov3_coco.pb'
 layout = "NCHW"
 
 data_shape = image_data.shape
-shape_dict = {'input/input_data': image_data.shape}
-dtype_dict = {'input/input_data': 'uint8'}
+input_name = 'input/input_data'
+#shape_dict = {'input/input_data': image_data.shape}
+#dtype_dict = {'input/input_data': 'uint8'}
+shape_dict = {input_name: data_shape}
+dtype_dict = {input_name: 'uint8'}
 
 return_elements = ["pred_sbbox/concat_2:0", "pred_mbbox/concat_2:0", "pred_lbbox/concat_2:0"]
 parser = TFParser(CHECKPOINT)
 graph_def = parser.parse()
-
+print("---------------------------front of from_tensorflow----------------") 
 mod, params = relay.frontend.from_tensorflow(graph_def,
                                              layout=layout,
                                              shape=shape_dict,
                                              outputs=return_elements)
 
+print("---------------------------after of from_tensorflow----------------") 
+#print(params)
 #category_file = os.path.join(CHECKPOINT, 'category.txt')
 classes = read_class_names('category.txt')
 num_classes = len(classes)
 
 tvm_target = 'llvm'
-target ='DPUCZDX8G-zcu104'
-net = mod["main"]
-mod = tvm.IRModule.from_expr(net)
+dpu_target ='DPUCZDX8G-zcu104'
+#net = mod["main"]
+#mod = tvm.IRModule.from_expr(net)
+mod = relay.transform.InferType()(mod)
+
+
+#-----------------------------------------------------------------------------------
+# For the edge target we recommend converting the layout to NHWC for best performance
+desired_layouts = {'nn.conv2d': ['NHWC', 'OIHW']}
+seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
+                                relay.transform.ConvertLayout(desired_layouts),
+                                relay.transform.FoldConstant()])
+with tvm.transform.PassContext(opt_level=3):
+     mod = seq(mod)
 
 mod["main"] = bind_params_by_name(mod["main"], params)
-mod = relay.transform.InferType()(mod)
-mod = annotation(mod, params, target)
+mod = annotation(mod, params, dpu_target)
 mod = relay.transform.MergeCompilerRegions()(mod)
 mod = relay.transform.PartitionGraph()(mod)
+
+# Convert convolutions that won't be executed on DPU back to NCHW
+desired_layouts = {'nn.conv2d': ['NCHW', 'default']}
+seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
+                                relay.transform.ConvertLayout(desired_layouts),
+                                relay.transform.FoldConstant()])
+with tvm.transform.PassContext(opt_level=3):
+     mod = seq(mod)
+
+#-----------------------------------------------------------------------------------
 
 
 # build the TVM runtime library for executing the model
 
-#from tvm.contrib import util
-temp = utils.tempdir()
-export_rt_mod_file = temp.relpath("vitis_ai.rtmod")
+#temp = utils.tempdir()
+#export_rt_mod_file = temp.relpath("vitis_ai.rtmod")
+export_rt_mod_file = os.path.join(os.getcwd(), 'vitis_ai.rtmod')
+with tvm.transform.PassContext(opt_level=3, 
+                               config= {'relay.ext.vitis_ai.options.target': dpu_target,
+                                        'relay.ext.vitis_ai.options.export_runtime_module': export_rt_mod_file}):
+     lib = relay.build(mod, tvm_target, params=params)
+    
+    
+#tvm_ops=4
+#lib = build_module(mod, target=tvm_target, dpu_target=dpu_target,  params=params, tvm_ops=tvm_ops)
+    
+    
+    
+InferenceSession = graph_runtime.GraphModule(lib["default"](tvm.cpu()))
+px_quant_size = int(os.environ['PX_QUANT_SIZE']) \
+                if 'PX_QUANT_SIZE' in os.environ else 128
 
-with tvm.transform.PassContext(opt_level=3, config= {'relay.ext.vitis_ai.options.target': target,
-                                                     'relay.ext.vitis_ai.options.export_runtime_module': export_rt_mod_file}):
-   lib = relay.build(mod, tvm_target, params=params)
+print("Quantize on first {} inputs".format(px_quant_size))
 
+DATA_DIR = os.path.join(str(Path.home()), 'voc/')
+print (DATA_DIR)
+file_dir = DATA_DIR
+img_files = [os.path.join(file_dir, f) for f in sorted(os.listdir(file_dir))
+             if f.endswith(('JPEG', 'jpg', 'png'))][:px_quant_size]
 
+#print(img_files)
+inputs = inputs_func(img_files)
+print('Loaded {} inputs successfully.'.format(len(inputs)))
 
-
-# We will quantize and compile the model for execution on the DPU using on-the-fly quantization on the host machine. 
-# This makes use of TVM inference calls (module.run) to quantize the model on the host with the first N inputs.
-
-m = graph_runtime.GraphModule(lib["default"](tvm.cpu()))
-dtype = 'float32'
-# First N (default = 128) inputs are used for quantization calibration and will
-# be executed on the CPU
-# This config can be changed by setting the 'PX_QUANT_SIZE' (e.g. export PX_QUANT_SIZE=64)
-for i in range(128):
-   m.set_input('input/input_data', tvm.nd.array(image_data.astype(dtype)))
-  # module.set_input(input_name, inputs[i])
-   m.run()
+#dtype = 'float32'
+for i in range(px_quant_size):
+#for i in range(5):
+    #InferenceSession.set_input('input/input_data', tvm.nd.array(image_data.astype(dtype)))
+    #InferenceSession.set_input('input/input_data', image_data)
+    InferenceSession.set_input(input_name, inputs[i])
+    #print(tvm.nd.array(image_data.astype(dtype)))
+    #print(inputs[i])
+    #print(inputs[i].shape)
+    InferenceSession.run()
 
 
 # get outputs
-print(m.get_output(0).shape)
-print(m.get_output(1).shape)
-print(m.get_output(2).shape)
+print(InferenceSession.get_output(0).shape)
+print(InferenceSession.get_output(1).shape)
+print(InferenceSession.get_output(2).shape)
 
 
-pred_sbbox = m.get_output(0).asnumpy()
-pred_mbbox = m.get_output(1).asnumpy()
-pred_lbbox = m.get_output(2).asnumpy()
+pred_sbbox = InferenceSession.get_output(0).asnumpy()
+pred_mbbox = InferenceSession.get_output(1).asnumpy()
+pred_lbbox = InferenceSession.get_output(2).asnumpy()
 
 pred_bbox = np.concatenate([np.reshape(pred_sbbox, (-1, 5 + num_classes)),
                             np.reshape(pred_mbbox, (-1, 5 + num_classes)),
@@ -288,6 +405,7 @@ lib.export_library("tvm_lib.so")
 # Export lib for aarch64 target
 #tvm_target = tvm.target.arm_cpu('DPUCZDX8G-zcu104')
 tvm_target = tvm.target.arm_cpu('ultra96')
+#tvm_target = tvm.target.arm_cpu('zcu104')
 lib_kwargs = {
      'fcompile': contrib.cc.create_shared,
      'cc': "/usr/aarch64-linux-gnu/bin/ld"
@@ -295,9 +413,13 @@ lib_kwargs = {
 
 with tvm.transform.PassContext(opt_level=3,
                                config={'relay.ext.vitis_ai.options.load_runtime_module': export_rt_mod_file}):
-     lib_arm = relay.build(mod, target=tvm_target, params=params)
+     lib_edge_dpu = relay.build(mod, target=tvm_target, params=params)
      #lib_arm = relay.build_module.build(mod, target=tvm_target, params=params)
 
 
-lib_dpuv2.export_library('tvm_dpu_arm.so', **lib_kwargs)
+#lib_dpuv2.export_library('tvm_dpu_arm.so', **lib_kwargs)
+lib_edge_dpu.export_library('tvm_dpu_arm.so', **lib_kwargs)
+
+
+
 
